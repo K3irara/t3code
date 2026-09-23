@@ -1036,16 +1036,6 @@ async function wakeIosLockScreen(udid: string): Promise<void> {
   }
 }
 
-/**
- * Devices with an always-on display dim the lock screen within seconds. A tap
- * on bare wallpaper, between the clock and the Live Activity, lights it back
- * up without unlocking or opening anything.
- */
-async function brightenIosLockScreen(udid: string): Promise<void> {
-  await runAxe(udid, ["tap", "-x", "200", "-y", "420"]);
-  await delay(1_000);
-}
-
 function pngIsBlack(bytes: Uint8Array): boolean {
   const { data } = PNG.sync.read(Buffer.from(bytes));
   // Sample a sparse grid; a sleeping display is uniformly black.
@@ -1184,7 +1174,6 @@ async function captureIos(
     }
     if (scene === "agent-activity") await presentIosLockScreen(simulator.udid);
     await delay(scene === "review" ? Math.max(config.settleDelayMs, 8_000) : config.settleDelayMs);
-    if (scene === "agent-activity") await brightenIosLockScreen(simulator.udid);
     const destination = NodePath.join(
       showcaseCaptureDirectory(outputDirectory, capture),
       `${scene}.png`,
