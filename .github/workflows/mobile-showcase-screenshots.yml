@@ -76,6 +76,11 @@ jobs:
           echo "$vp_pnpm_bin" >> "$GITHUB_PATH"
           "$vp_pnpm_bin/pnpm" --version
 
+      - name: Install AXe
+        # Locks the simulator and answers the notification prompt for the
+        # agent-activity scene.
+        run: brew tap cameroncooke/axe && brew install axe
+
       - name: Capture iOS showcase
         run: pnpm screenshots:mobile --platform ios --appearance "${{ inputs.appearance }}" --theme "${{ inputs.theme }}"
 

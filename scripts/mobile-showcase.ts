@@ -26,6 +26,7 @@ import showcaseConfig, {
 import {
   SHOWCASE_ENVIRONMENTS,
   SHOWCASE_PROJECTS,
+  SHOWCASE_THREADS,
   seedShowcaseEnvironment,
 } from "./mobile-showcase-environment.ts";
 
@@ -934,6 +935,98 @@ async function waitForIosShowcaseScene(
   throw new Error(`iOS showcase scene '${scene}' did not render within ${timeoutMs}ms.`);
 }
 
+function iosAxe(): string {
+  return NodeProcess.env.AXE_PATH ?? "axe";
+}
+
+async function runAxe(udid: string, args: ReadonlyArray<string>): Promise<void> {
+  // HID events sent right after the simulator settles are dropped without it.
+  await runCommand(iosAxe(), [...args, "--udid", udid], {
+    env: { ...NodeProcess.env, AXE_HID_STABILIZATION_MS: "3000" },
+  }).catch((error: unknown) => {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new Error(
+        "The agent-activity scene drives the simulator with AXe. Install it with `brew tap cameroncooke/axe && brew install axe`, or set AXE_PATH.",
+      );
+    }
+    throw error;
+  });
+}
+
+async function iosSimulatorLocked(udid: string): Promise<boolean> {
+  const state = await commandOutput("xcrun", [
+    "simctl",
+    "spawn",
+    udid,
+    "notifyutil",
+    "-g",
+    "com.apple.springboard.lockstate",
+  ]).catch(() => "");
+  return state.trim().endsWith(" 1");
+}
+
+/**
+ * The staging app asks for notification permission; simctl has no privacy
+ * service for it, so answer the prompt until the scene reports ready.
+ */
+async function allowIosNotificationsUntilReady(udid: string, ready: Promise<void>): Promise<void> {
+  const state = { settled: false };
+  const tapping = (async () => {
+    while (!state.settled) {
+      await runAxe(udid, ["tap", "--label", "Allow"]).catch(() => undefined);
+      if (!state.settled) await delay(1_000);
+    }
+  })();
+  try {
+    await ready;
+  } finally {
+    state.settled = true;
+    await tapping;
+  }
+}
+
+/**
+ * Locks the simulator over the staged Live Activity and delivers the alert a
+ * relay push would, so the lock screen shows both.
+ */
+async function presentIosLockScreen(udid: string): Promise<void> {
+  await runAxe(udid, ["button", "lock"]);
+  const deadline = Date.now() + 15_000;
+  while (!(await iosSimulatorLocked(udid))) {
+    if (Date.now() > deadline) throw new Error(`Simulator ${udid} did not lock.`);
+    await delay(500);
+  }
+  const alert = showcaseAgentAlert();
+  await new Promise<void>((resolve, reject) => {
+    const child = NodeChildProcess.execFile(
+      "xcrun",
+      ["simctl", "push", udid, ANDROID_PACKAGE, "-"],
+      { cwd: REPO_ROOT },
+      (error) => (error ? reject(error) : resolve()),
+    );
+    child.stdin?.end(
+      JSON.stringify({
+        aps: { alert: { title: alert.title, body: alert.body }, sound: "default" },
+      }),
+    );
+  });
+}
+
+async function unlockIosSimulator(udid: string): Promise<void> {
+  // The first press wakes the display, the second dismisses the lock screen.
+  await runAxe(udid, ["button", "home"]);
+  await delay(2_000);
+  await runAxe(udid, ["button", "home"]);
+}
+
+/** Mirrors the app's staged hero row (showcaseAgentActivity.ts). */
+function showcaseAgentAlert(): { readonly title: string; readonly body: string } {
+  const thread = SHOWCASE_THREADS.find((candidate) => candidate.id === "pocket-command-center");
+  const project = SHOWCASE_PROJECTS.find((candidate) => candidate.id === thread?.projectId);
+  if (!thread || !project) throw new Error("The showcase fixture lost its agent-activity thread.");
+  return { title: thread.title, body: `Approval: ${project.title}` };
+}
+
 async function captureIos(
   capture: ShowcaseCapture & { readonly device: ShowcaseIosDevice },
   appPath: string | null,
@@ -1021,6 +1114,12 @@ async function captureIos(
   for (const [sceneIndex, scene] of capture.scenes.entries()) {
     if (sceneIndex > 0) await NodeFSP.rm(readyPath, { force: true });
     await NodeFSP.writeFile(scenePath, scene);
+    const waitForScene = (timeoutMs?: number) => {
+      const ready = waitForIosShowcaseScene(simulator.udid, scene, timeoutMs);
+      return scene === "agent-activity"
+        ? allowIosNotificationsUntilReady(simulator.udid, ready)
+        : ready;
+    };
     if (sceneIndex === 0) {
       for (let attempt = 0; attempt < 2; attempt += 1) {
         const isLastAttempt = attempt === 1;
@@ -1028,7 +1127,7 @@ async function captureIos(
           // A freshly installed Expo development build can spend well over 30s
           // applying an already-bundled update after it reaches 100%. Killing it
           // at that point sends the next capture back to the dev launcher.
-          await waitForIosShowcaseScene(simulator.udid, scene, 120_000);
+          await waitForScene(120_000);
           break;
         } catch (error) {
           if (isLastAttempt) throw error;
@@ -1036,8 +1135,9 @@ async function captureIos(
         }
       }
     } else {
-      await waitForIosShowcaseScene(simulator.udid, scene);
+      await waitForScene();
     }
+    if (scene === "agent-activity") await presentIosLockScreen(simulator.udid);
     await delay(scene === "review" ? Math.max(config.settleDelayMs, 8_000) : config.settleDelayMs);
     const destination = NodePath.join(
       showcaseCaptureDirectory(outputDirectory, capture),
@@ -1053,6 +1153,7 @@ async function captureIos(
         await runCommand("sips", ["--rotate", "270", destination]);
       }
     }
+    if (scene === "agent-activity") await unlockIosSimulator(simulator.udid);
     await finalizeCapture(destination, capture.device);
   }
 }
@@ -1248,6 +1349,15 @@ async function captureAndroid(
     await runAdb(serial, ["install", "-r", apkPath]);
   }
   await runAdb(serial, ["shell", "pm", "clear", ANDROID_PACKAGE]);
+  // The agent-activity scene posts notifications; granting up front keeps the
+  // runtime prompt off every capture.
+  await runAdb(serial, [
+    "shell",
+    "pm",
+    "grant",
+    ANDROID_PACKAGE,
+    "android.permission.POST_NOTIFICATIONS",
+  ]);
   await prepareAndroidShowcaseApp(serial);
   await runAdb(serial, ["reverse", `tcp:${config.metroPort}`, `tcp:${config.metroPort}`]);
   const metroUrl = encodeURIComponent(`http://127.0.0.1:${config.metroPort}?disableOnboarding=1`);
@@ -1275,6 +1385,9 @@ async function captureAndroid(
   for (const [sceneIndex, scene] of capture.scenes.entries()) {
     if (sceneIndex > 0) await writeAndroidShowcaseScene(serial, scene);
     await waitForAndroidShowcaseScene(serial, scene);
+    if (scene === "agent-activity") {
+      await runAdb(serial, ["shell", "cmd", "statusbar", "expand-notifications"]);
+    }
     await delay(Math.max(config.settleDelayMs, scene === "review" ? 8_000 : 5_000));
     const destination = NodePath.join(
       showcaseCaptureDirectory(outputDirectory, capture),
@@ -1292,6 +1405,9 @@ async function captureAndroid(
       );
     });
     await NodeFSP.writeFile(destination, png);
+    if (scene === "agent-activity") {
+      await runAdb(serial, ["shell", "cmd", "statusbar", "collapse"]);
+    }
     await finalizeCapture(destination, capture.device);
   }
 }
