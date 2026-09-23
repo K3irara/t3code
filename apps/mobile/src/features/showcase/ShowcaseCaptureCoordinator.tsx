@@ -118,6 +118,7 @@ export function ShowcaseCaptureCoordinator(props: { readonly pathname: string })
     }
 
     let cancelled = false;
+    let lastOutcome: string | null = null;
     void retryShowcaseOperation(async () => applyNativeShowcaseOrientation(orientation), {
       isCancelled: () => cancelled,
     }).then((applied) => {
@@ -238,8 +239,13 @@ export function ShowcaseCaptureCoordinator(props: { readonly pathname: string })
       environmentId: String(showcaseThread.environmentId),
       threadId: SHOWCASE_THREAD_ID,
     };
-    if (requestedScene === "threads" || requestedScene === "agent-activity") {
+    if (requestedScene === "threads") {
       navigation.dispatch(StackActions.popToTop());
+      return;
+    }
+    // Follows the environments scene, whose settings sheet popToTop leaves open.
+    if (requestedScene === "agent-activity") {
+      navigation.dispatch(CommonActions.reset({ index: 0, routes: [{ name: "Home" }] }));
       return;
     }
     const routes: ShowcaseResetRoute[] = [{ name: "Home" }];
@@ -283,12 +289,22 @@ export function ShowcaseCaptureCoordinator(props: { readonly pathname: string })
       return;
     }
     let cancelled = false;
+    let lastOutcome: string | null = null;
     void retryShowcaseOperation(
       async () => {
         const now = Date.now();
         const { threads: latestThreads, projects: latestProjects } = entitiesRef.current;
         const activity = buildShowcaseAgentActivity(latestThreads, latestProjects, now);
-        return activity !== null && (await stageShowcaseAgentActivity(activity, now));
+        const outcome =
+          activity === null
+            ? "fixture threads not loaded"
+            : await stageShowcaseAgentActivity(activity, now);
+        if (outcome === true) return true;
+        // Surfaces in the runner's Metro output when the scene never turns ready.
+        if (outcome !== lastOutcome)
+          console.warn(`[showcase] agent activity not staged: ${outcome}`);
+        lastOutcome = outcome;
+        return false;
       },
       // The first attempt waits on the notification permission prompt until
       // the runner answers it.
