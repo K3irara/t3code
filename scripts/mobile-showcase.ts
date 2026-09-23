@@ -1010,6 +1010,41 @@ async function presentIosLockScreen(udid: string): Promise<void> {
       }),
     );
   });
+  await wakeIosLockScreen(udid);
+  // The first Live Activity on the lock screen asks to keep allowing them.
+  await delay(2_000);
+  await runAxe(udid, ["tap", "--label", "Allow"]).catch(() => undefined);
+}
+
+/**
+ * The alert usually wakes the display, but not always. A home press on a dark
+ * display only wakes it, so press only after a screenshot proves it is dark;
+ * pressing on a lit lock screen would unlock the device instead.
+ */
+async function wakeIosLockScreen(udid: string): Promise<void> {
+  const probe = NodePath.join(NodeOS.tmpdir(), `t3-showcase-wake-${udid}.png`);
+  try {
+    for (let attempt = 0; attempt < 5; attempt += 1) {
+      await delay(2_000);
+      await runCommand("xcrun", ["simctl", "io", udid, "screenshot", probe]);
+      if (!pngIsBlack(await NodeFSP.readFile(probe))) return;
+      await runAxe(udid, ["button", "home"]);
+    }
+    throw new Error(`Simulator ${udid} lock screen stayed dark.`);
+  } finally {
+    await NodeFSP.rm(probe, { force: true });
+  }
+}
+
+function pngIsBlack(bytes: Uint8Array): boolean {
+  const { data } = PNG.sync.read(Buffer.from(bytes));
+  // Sample a sparse grid; a sleeping display is uniformly black.
+  for (let offset = 0; offset < data.length; offset += 4 * 997) {
+    if ((data[offset] ?? 0) > 8 || (data[offset + 1] ?? 0) > 8 || (data[offset + 2] ?? 0) > 8) {
+      return false;
+    }
+  }
+  return true;
 }
 
 async function unlockIosSimulator(udid: string): Promise<void> {
