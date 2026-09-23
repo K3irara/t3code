@@ -1036,6 +1036,16 @@ async function wakeIosLockScreen(udid: string): Promise<void> {
   }
 }
 
+/**
+ * Devices with an always-on display dim the lock screen within seconds. A tap
+ * on bare wallpaper, between the clock and the Live Activity, lights it back
+ * up without unlocking or opening anything.
+ */
+async function brightenIosLockScreen(udid: string): Promise<void> {
+  await runAxe(udid, ["tap", "-x", "200", "-y", "420"]);
+  await delay(1_000);
+}
+
 function pngIsBlack(bytes: Uint8Array): boolean {
   const { data } = PNG.sync.read(Buffer.from(bytes));
   // Sample a sparse grid; a sleeping display is uniformly black.
@@ -1174,6 +1184,7 @@ async function captureIos(
     }
     if (scene === "agent-activity") await presentIosLockScreen(simulator.udid);
     await delay(scene === "review" ? Math.max(config.settleDelayMs, 8_000) : config.settleDelayMs);
+    if (scene === "agent-activity") await brightenIosLockScreen(simulator.udid);
     const destination = NodePath.join(
       showcaseCaptureDirectory(outputDirectory, capture),
       `${scene}.png`,
@@ -1203,6 +1214,22 @@ async function adbOutput(serial: string, args: ReadonlyArray<string>): Promise<s
 
 async function runAdb(serial: string, args: ReadonlyArray<string>): Promise<void> {
   await runCommand(androidSdkTool("platform-tools/adb"), ["-s", serial, ...args]);
+}
+
+/**
+ * Emulator images post their own ongoing notices (keyboard configured, serial
+ * console enabled) that would share the shade with the app's. Snoozing hides
+ * them for the capture; they come back on their own an hour later.
+ */
+async function snoozeAndroidSystemNotifications(serial: string): Promise<void> {
+  const keys = (await adbOutput(serial, ["shell", "cmd", "notification", "list"]))
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((key) => key.includes("|") && !key.includes(`|${ANDROID_PACKAGE}|`));
+  for (const key of keys) {
+    // adb joins shell args with spaces, so the key needs quoting for the pipes.
+    await runAdb(serial, ["shell", `cmd notification snooze --for 3600000 '${key}'`]);
+  }
 }
 
 async function runningAndroidAvds(): Promise<ReadonlyMap<string, string>> {
@@ -1421,6 +1448,7 @@ async function captureAndroid(
     if (sceneIndex > 0) await writeAndroidShowcaseScene(serial, scene);
     await waitForAndroidShowcaseScene(serial, scene);
     if (scene === "agent-activity") {
+      await snoozeAndroidSystemNotifications(serial);
       await runAdb(serial, ["shell", "cmd", "statusbar", "expand-notifications"]);
     }
     await delay(Math.max(config.settleDelayMs, scene === "review" ? 8_000 : 5_000));
