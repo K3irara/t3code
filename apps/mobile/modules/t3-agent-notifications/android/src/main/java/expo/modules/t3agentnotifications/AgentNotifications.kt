@@ -147,7 +147,12 @@ object AgentNotifications {
     }
   }
 
-  private fun postAlert(context: Context, scheme: String, data: Map<String, String>, alertId: String) {
+  private fun postAlert(
+    context: Context,
+    scheme: String,
+    data: Map<String, String>,
+    alertId: String
+  ) {
     val title = data["alert_title"].orEmpty().take(120)
     // Grouped alerts list up to five 120-character thread titles.
     val body = data["alert_body"].orEmpty().take(608)
