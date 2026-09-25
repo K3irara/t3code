@@ -1566,7 +1566,9 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           new Map<string, ReadonlyArray<PendingCodexSubagentTurnStarted>>(),
         );
         const nextProviderTurnOrdinals = yield* Ref.make(new Map<string, number>());
-        const itemOrdinals = yield* Ref.make(new Map<string, number>());
+        const itemPositions = yield* Ref.make(
+          new Map<string, { readonly ordinal: number; readonly startedAt: DateTime.Utc }>(),
+        );
         const nextItemOrdinalsByTurn = yield* Ref.make(new Map<string, number>());
         const providerRetries = yield* Ref.make(
           new Map<ProviderTurnId, ActiveCodexProviderRetry>(),
@@ -1883,7 +1885,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 driver: CODEX_PROVIDER,
                 nativeItemId: tracked.id,
               });
-              const ordinal = yield* resolveItemOrdinal(context, tracked.id);
+              const { ordinal, startedAt } = yield* resolveItemPosition(context, tracked.id);
               const node: OrchestrationV2ExecutionNode = {
                 id: nodeId,
                 threadId: context.projectionThreadId,
@@ -1898,7 +1900,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 nativeItemRef: codexNativeItemRef(tracked.id),
                 runtimeRequestId: null,
                 checkpointScopeId: null,
-                startedAt: context.startedAt,
+                startedAt,
                 completedAt,
               };
               const turnItem: OrchestrationV2TurnItem = {
@@ -1913,7 +1915,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
                 ordinal,
                 status,
                 title: null,
-                startedAt: context.startedAt,
+                startedAt,
                 completedAt,
                 updatedAt: completedAt,
                 type: "command_execution",
@@ -2029,9 +2031,17 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             });
           });
 
-        const resolveItemOrdinal = (context: ActiveCodexTurnContext, nativeItemId: string) =>
+        /**
+         * Allocates an item's ordinal and start time on first sight. `item/started` seeds
+         * Codex's own start time; items that stream without it start when first seen.
+         */
+        const resolveItemPosition = (
+          context: ActiveCodexTurnContext,
+          nativeItemId: string,
+          startedAt?: DateTime.Utc,
+        ) =>
           Effect.gen(function* () {
-            const existing = (yield* Ref.get(itemOrdinals)).get(nativeItemId);
+            const existing = (yield* Ref.get(itemPositions)).get(nativeItemId);
             if (existing !== undefined) {
               return existing;
             }
@@ -2043,14 +2053,22 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               updated.set(turnKey, next);
               return [next, updated];
             });
-            const nextOrdinal = context.providerTurnOrdinal * 100 + nextWithinTurn;
-            yield* Ref.update(itemOrdinals, (current) => {
+            const position = {
+              ordinal: context.providerTurnOrdinal * 100 + nextWithinTurn,
+              startedAt: startedAt ?? (yield* DateTime.now),
+            };
+            yield* Ref.update(itemPositions, (current) => {
               const updated = new Map(current);
-              updated.set(nativeItemId, nextOrdinal);
+              updated.set(nativeItemId, position);
               return updated;
             });
-            return nextOrdinal;
+            return position;
           });
+
+        const resolveItemOrdinal = (context: ActiveCodexTurnContext, nativeItemId: string) =>
+          resolveItemPosition(context, nativeItemId).pipe(
+            Effect.map((position) => position.ordinal),
+          );
 
         const nextProviderTurnOrdinal = (
           providerThreadId: OrchestrationV2ProviderThread["id"],
@@ -2734,7 +2752,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: item.id,
             });
-            const ordinal = yield* resolveItemOrdinal(context, item.id);
+            const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
             const messageId = idAllocator.derive.messageFromProviderItem({
               driver: CODEX_PROVIDER,
               nativeItemId: item.id,
@@ -2757,7 +2775,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
             };
             const message: OrchestrationV2ConversationMessage = {
@@ -2771,7 +2789,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               text: item.text,
               attachments: [],
               streaming: !completed,
-              createdAt: context.startedAt,
+              createdAt: startedAt,
               updatedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -2786,7 +2804,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               ordinal,
               status: completed ? "completed" : "running",
               title: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "assistant_message",
@@ -3021,7 +3039,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: item.id,
             });
-            const ordinal = yield* resolveItemOrdinal(context, item.id);
+            const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
             const node: OrchestrationV2ExecutionNode = {
               id: nodeId,
               threadId: context.projectionThreadId,
@@ -3036,7 +3054,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -3051,7 +3069,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               ordinal,
               status: status.turnItem,
               title: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "command_execution",
@@ -3090,7 +3108,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: item.id,
             });
-            const ordinal = yield* resolveItemOrdinal(context, item.id);
+            const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
             const node: OrchestrationV2ExecutionNode = {
               id: nodeId,
               threadId: context.projectionThreadId,
@@ -3105,7 +3123,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -3120,7 +3138,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               ordinal,
               status: status.turnItem,
               title: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "file_change",
@@ -3146,7 +3164,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: input.item.id,
             });
-            const ordinal = yield* resolveItemOrdinal(input.context, input.item.id);
+            const { ordinal, startedAt } = yield* resolveItemPosition(input.context, input.item.id);
             const patterns = webSearchPatterns(input.item);
             const status = input.completed ? "completed" : "running";
             const node: OrchestrationV2ExecutionNode = {
@@ -3163,7 +3181,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(input.item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: input.context.startedAt,
+              startedAt,
               completedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -3178,7 +3196,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               ordinal,
               status,
               title: null,
-              startedAt: input.context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "web_search",
@@ -3203,7 +3221,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: item.id,
             });
-            const ordinal = yield* resolveItemOrdinal(context, item.id);
+            const { ordinal, startedAt } = yield* resolveItemPosition(context, item.id);
             const projection = projectCodexDynamicToolItem(item);
             const node: OrchestrationV2ExecutionNode = {
               id: nodeId,
@@ -3219,7 +3237,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(item.id),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -3233,7 +3251,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               parentItemId: null,
               ordinal,
               title: projection.title ?? null,
-              startedAt: context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "dynamic_tool",
@@ -3261,7 +3279,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: input.nativeItemId,
             });
-            const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
+            const { ordinal, startedAt } = yield* resolveItemPosition(
+              input.context,
+              input.nativeItemId,
+            );
             const plan: OrchestrationV2PlanArtifact = {
               id: planId,
               threadId: input.context.projectionThreadId,
@@ -3285,7 +3306,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(input.nativeItemId),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: input.context.startedAt,
+              startedAt,
               completedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -3300,7 +3321,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               ordinal,
               status: input.completed === true ? "completed" : "running",
               title: null,
-              startedAt: input.context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "proposed_plan",
@@ -3331,7 +3352,10 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               driver: CODEX_PROVIDER,
               nativeItemId: input.nativeItemId,
             });
-            const ordinal = yield* resolveItemOrdinal(input.context, input.nativeItemId);
+            const { ordinal, startedAt } = yield* resolveItemPosition(
+              input.context,
+              input.nativeItemId,
+            );
             const plan: OrchestrationV2PlanArtifact = {
               id: planId,
               threadId: input.context.projectionThreadId,
@@ -3356,7 +3380,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               nativeItemRef: codexNativeItemRef(input.nativeItemId),
               runtimeRequestId: null,
               checkpointScopeId: null,
-              startedAt: input.context.startedAt,
+              startedAt,
               completedAt,
             };
             const turnItem: OrchestrationV2TurnItem = {
@@ -3371,7 +3395,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               ordinal,
               status: input.completed === true ? "completed" : "running",
               title: null,
-              startedAt: input.context.startedAt,
+              startedAt,
               completedAt,
               updatedAt,
               type: "todo_list",
@@ -3921,6 +3945,14 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             }
 
             yield* completeProviderRetry(context, yield* DateTime.now);
+            // Reasoning streams per part, so its parts take their own first-seen times.
+            if (payload.item.type !== "reasoning") {
+              yield* resolveItemPosition(
+                context,
+                payload.item.id,
+                DateTime.makeUnsafe(payload.startedAtMs),
+              );
+            }
 
             if (payload.item.type === "agentMessage") {
               if (payload.item.phase !== "commentary") {
