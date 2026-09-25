@@ -998,7 +998,7 @@ it.effect("checkpoint capture reuses its index so unchanged untracked files are 
     const warmCommands = yield* captureCommands(second);
 
     assert.strictEqual(yield* fs.readFileString(path.join(cwd, ".git/reads")), "read\n");
-    assert.isFalse(warmCommands.some((command) => command.includes("read-tree")));
+    assert.isFalse(warmCommands.some((command) => command.includes("read-tree --reset")));
     for (const [name, content] of [
       ["cache/stable.dat", "cache/stable.dat\n"],
       ["cache/edited.dat", "edited\n"],
@@ -1011,7 +1011,7 @@ it.effect("checkpoint capture reuses its index so unchanged untracked files are 
 
     yield* fs.remove(checkpointIndex);
     const coldCommands = yield* captureCommands(cold);
-    assert.isTrue(coldCommands.some((command) => command.includes("read-tree")));
+    assert.isTrue(coldCommands.some((command) => command.includes("read-tree --reset")));
     assert.strictEqual(
       (yield* git(["rev-parse", `${second}^{tree}`])).stdout,
       (yield* git(["rev-parse", `${cold}^{tree}`])).stdout,
@@ -1032,8 +1032,9 @@ it.effect("checkpoint index reuse follows ignore rules like a fresh capture", ()
         .makeDirectory(path.dirname(path.join(cwd, name)), { recursive: true })
         .pipe(Effect.andThen(fs.writeFileString(path.join(cwd, name), `${name}\n`)));
     yield* write("tracked.log");
-    yield* git(["add", "tracked.log"]);
-    yield* git(["commit", "-m", "track a log"]);
+    yield* write("unindexed.log");
+    yield* git(["add", "tracked.log", "unindexed.log"]);
+    yield* git(["commit", "-m", "track logs"]);
     yield* write("later.log");
     yield* write("build/out.o");
     const first = CheckpointRef.make("refs/t3/checkpoints/ignored/first");
@@ -1050,6 +1051,10 @@ it.effect("checkpoint index reuse follows ignore rules like a fresh capture", ()
     yield* write("forced.log");
     yield* git(["add", "--force", "forced.log"]);
     yield* git(["commit", "-m", "track an ignored log"]);
+    // A fresh capture starts from HEAD, so staged changes to ignored files do not count.
+    yield* write("staged.log");
+    yield* git(["add", "--force", "staged.log"]);
+    yield* git(["rm", "--cached", "--quiet", "unindexed.log"]);
     yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: second });
 
     assert.sameMembers(yield* files(second), [
@@ -1057,6 +1062,7 @@ it.effect("checkpoint index reuse follows ignore rules like a fresh capture", ()
       "file.txt",
       "forced.log",
       "tracked.log",
+      "unindexed.log",
     ]);
     yield* fs.remove(path.join(cwd, ".git/t3-checkpoint-index"));
     yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: cold });
@@ -1092,7 +1098,7 @@ it.effect.each(["corrupt", "pruned"] as const)(
 
       yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: second });
 
-      assert.isTrue(commands.some((args) => args.includes("read-tree")));
+      assert.isTrue(commands.some((args) => args.join(" ").includes("read-tree --reset")));
       assert.strictEqual((yield* git(["show", `${second}:untracked.txt`])).stdout, "untracked\n");
       const replaced = yield* fs.readFile(checkpointIndex);
       assert.strictEqual(new TextDecoder().decode(replaced.subarray(0, 4)), "DIRC");
@@ -1139,7 +1145,7 @@ it.effect("checkpoint capture stays cold when its ignored entries overflow the l
         commands.some((command) => command.includes("--ignored")),
         turn === "second",
       );
-      assert.isTrue(commands.some((command) => command.includes("read-tree")));
+      assert.isTrue(commands.some((command) => command.includes("read-tree --reset")));
       assert.strictEqual(yield* tree(checkpointRef), yield* tree(first));
       assert.strictEqual(
         (yield* git(["show", `${checkpointRef}:tracked.log`])).stdout,

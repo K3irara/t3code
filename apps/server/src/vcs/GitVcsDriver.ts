@@ -806,9 +806,10 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
         GIT_COMMITTER_EMAIL: "t3code@users.noreply.github.com",
       };
 
+      const headIndexPath = `${tempIndexPath}-head`;
       // Forced process termination can leave Git's private index lock behind.
       const cleanupTempIndex = Effect.forEach(
-        [tempIndexPath, `${tempIndexPath}.lock`],
+        [tempIndexPath, `${tempIndexPath}.lock`, headIndexPath, `${headIndexPath}.lock`],
         (indexFile) => fileSystem.remove(indexFile, { force: true }).pipe(Effect.ignore),
         { discard: true },
       );
@@ -849,15 +850,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           return true;
         }).pipe(Effect.catch(() => cleanupTempIndex.pipe(Effect.as(false))));
       // `add -A` never drops an ignored entry or adds an ignored file, so a reused index would keep
-      // files captured before they became ignored and miss ignored files tracked since. Keep an
-      // ignored path only if the user's index tracks it, as a fresh capture does.
-      const syncIgnoredEntries = Effect.gen(function* () {
-        const listIgnored = (env?: NodeJS.ProcessEnv) =>
+      // files captured before they became ignored and miss ignored files tracked since. A fresh
+      // capture starts from HEAD, not the user's staged changes, so keep an ignored path only if
+      // HEAD tracks it.
+      const syncIgnoredEntries = Effect.fn(function* (headExists: boolean) {
+        const listIgnored = (env: NodeJS.ProcessEnv) =>
           execute({
             operation,
             cwd: input.cwd,
             args: [...indexConfig, "ls-files", "-z", "--cached", "--ignored", "--exclude-standard"],
-            ...(env !== undefined ? { env } : {}),
+            env,
             maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
             outputMode: "error",
           }).pipe(
@@ -871,7 +873,15 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             ),
           );
         const captured = yield* listIgnored(commitEnv);
-        const tracked = yield* listIgnored();
+        const headEnv = { ...commitEnv, GIT_INDEX_FILE: headIndexPath };
+        const tracked = headExists
+          ? yield* execute({
+              operation,
+              cwd: input.cwd,
+              args: [...indexConfig, "read-tree", "HEAD"],
+              env: headEnv,
+            }).pipe(Effect.andThen(listIgnored(headEnv)))
+          : new Set<string>();
         const updateIndex = (flags: ReadonlyArray<string>, paths: ReadonlyArray<string>) =>
           paths.length === 0
             ? Effect.void
@@ -1095,7 +1105,7 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
               ),
           }),
         );
-        if (reusedCheckpointIndex) yield* syncIgnoredEntries;
+        if (reusedCheckpointIndex) yield* syncIgnoredEntries(headExists);
 
         const writeTreeResult = yield* execute({
           operation,
