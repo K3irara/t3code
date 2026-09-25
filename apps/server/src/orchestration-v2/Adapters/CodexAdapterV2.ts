@@ -2975,6 +2975,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             | CodexSchema.V2ItemCompletedNotification__ThreadItem,
             { type: "userMessage" }
           >,
+          nativeStartedAt?: DateTime.Utc,
         ) =>
           Effect.gen(function* () {
             if (context.subagent === null || context.providerTurnOrdinal === 1) {
@@ -2984,8 +2985,11 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             if (text.length === 0) {
               return false;
             }
-            const now = yield* DateTime.now;
-            const ordinal = yield* resolveItemOrdinal(context, item.id);
+            const { ordinal, startedAt } = yield* resolveItemPosition(
+              context,
+              item.id,
+              nativeStartedAt,
+            );
             const artifacts = makeSubagentConversationArtifacts({
               senderThreadId: context.subagent.parentContext.projectionThreadId,
               messageId: idAllocator.derive.messageFromProviderItem({
@@ -3004,7 +3008,7 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               role: "user",
               text,
               ordinal,
-              now,
+              now: startedAt,
             });
             yield* emitProviderEvent({
               type: "message.updated",
@@ -3889,8 +3893,14 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
           context: ActiveCodexTurnContext,
           nativeItemId: string,
           status: "running" | "completed",
+          nativeStartedAt?: DateTime.Utc,
         ) {
           const now = yield* DateTime.now;
+          const { ordinal, startedAt } = yield* resolveItemPosition(
+            context,
+            nativeItemId,
+            nativeStartedAt,
+          );
           yield* emitProviderEvent({
             type: "turn_item.updated",
             driver: CODEX_PROVIDER,
@@ -3906,12 +3916,12 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
               providerTurnId: context.providerTurnId,
               nativeItemRef: codexNativeItemRef(nativeItemId),
               parentItemId: null,
-              ordinal: yield* resolveItemOrdinal(context, nativeItemId),
+              ordinal,
               type: "compaction",
               driver: CODEX_PROVIDER,
               status,
               title: status === "completed" ? "Context compacted" : "Compacting context",
-              startedAt: now,
+              startedAt,
               completedAt: status === "completed" ? now : null,
               updatedAt: now,
             },
@@ -3926,12 +3936,21 @@ export function makeCodexAdapterV2(adapterOptions: CodexAdapterV2Options): Provi
             }
 
             if (payload.item.type === "contextCompaction") {
-              yield* emitCompactionItem(context, payload.item.id, "running");
+              yield* emitCompactionItem(
+                context,
+                payload.item.id,
+                "running",
+                DateTime.makeUnsafe(payload.startedAtMs),
+              );
               return;
             }
 
             if (payload.item.type === "userMessage") {
-              yield* emitSubagentUserMessage(context, payload.item);
+              yield* emitSubagentUserMessage(
+                context,
+                payload.item,
+                DateTime.makeUnsafe(payload.startedAtMs),
+              );
               return;
             }
 

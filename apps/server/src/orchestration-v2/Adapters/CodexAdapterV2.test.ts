@@ -2636,6 +2636,21 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ...codexReplayPreamble({ nativeThreadId, nativeTurnId, prompt: "Run two commands." }),
             ...commandLifecycle("first-command", 1782622445000),
             ...commandLifecycle("second-command", 1782622505000),
+            ...(["started", "completed"] as const).map((phase) => ({
+              type: "emit_inbound" as const,
+              label: `item/${phase}/compaction`,
+              frame: {
+                method: `item/${phase}`,
+                params: {
+                  threadId: nativeThreadId,
+                  turnId: nativeTurnId,
+                  ...(phase === "started"
+                    ? { startedAtMs: 1782622565000 }
+                    : { completedAtMs: 1782622575000 }),
+                  item: { type: "contextCompaction", id: "compaction" },
+                },
+              },
+            })),
             {
               type: "emit_inbound",
               label: "turn/completed",
@@ -2662,7 +2677,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         yield* awaitUntil(() => harness.terminalEvents().length === 1, "Codex item start times");
 
         const startedAtByItem = harness.events.flatMap((event) =>
-          event.type === "turn_item.updated" && event.turnItem.type === "command_execution"
+          event.type === "turn_item.updated" &&
+          (event.turnItem.type === "command_execution" || event.turnItem.type === "compaction")
             ? [[event.turnItem.nativeItemRef?.nativeId, event.turnItem.startedAt] as const]
             : [],
         );
@@ -2673,6 +2689,8 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             ["first-command", 1782622445000],
             ["second-command", 1782622505000],
             ["second-command", 1782622505000],
+            ["compaction", 1782622565000],
+            ["compaction", 1782622565000],
           ],
         );
       }).pipe(Effect.provide(Layer.merge(idAllocatorLayer, NodeServices.layer))),
