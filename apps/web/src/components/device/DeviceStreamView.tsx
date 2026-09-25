@@ -10,6 +10,7 @@ import { deviceKeyboard, deviceModel } from "./deviceModels";
 import { fitDeviceFrame } from "./deviceFrameLayout";
 import { DeviceDuoViewport } from "./DeviceDuoViewport";
 import { DeviceDuoControls } from "./DeviceDuoControls";
+import { DeviceAndroidFoldControls } from "./DeviceAndroidFoldControls";
 import type { DuoControlState } from "@t3tools/client-runtime/device/duo-control";
 import { DevicePhoneViewport } from "./DevicePhoneViewport";
 import { DeviceLoadingView } from "./DeviceLoadingView";
@@ -330,7 +331,17 @@ export function DeviceStreamView(props: {
             streaming: status === "streaming",
             phoneUnavailableReason,
             foldingControls:
-              showPhone && isDuo && screen?.supportsHingeAngle ? (
+              props.platform === "android" && access ? (
+                <DeviceAndroidFoldControls
+                  key={`${props.hostId}:${props.deviceId}`}
+                  access={access}
+                  deviceId={props.deviceId}
+                  visible={props.visible}
+                  enabled={status === "streaming"}
+                  screenWidth={screen?.width}
+                  screenHeight={screen?.height}
+                />
+              ) : showPhone && isDuo && screen?.supportsHingeAngle ? (
                 <DeviceDuoControls
                   screen={screen}
                   state={duoControl}
