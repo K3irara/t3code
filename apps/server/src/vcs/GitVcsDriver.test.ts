@@ -1127,7 +1127,9 @@ it.effect.each(["win32", "linux"] as const)(
       const liveProcess = yield* VcsProcess.VcsProcess;
       const driver = yield* GitVcsDriver.makeVcsDriverShape();
       const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-long-paths-" });
-      const { checkpointRef } = yield* makeCheckpointFixture(driver, cwd);
+      const { git, checkpointRef } = yield* makeCheckpointFixture(driver, cwd);
+      // An unborn nested repository fails the first `add`, so recovery's listing runs too.
+      yield* git(["init", "empty"]);
       const observedArgs: ReadonlyArray<string>[] = [];
       const platformDriver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
         Effect.provideService(HostProcessPlatform, platform),
@@ -1144,10 +1146,12 @@ it.effect.each(["win32", "linux"] as const)(
       assert.isTrue(yield* platformDriver.checkpoints.restoreCheckpoint({ cwd, checkpointRef }));
 
       assert.strictEqual(yield* fs.readFileString(path.join(cwd, "file.txt")), "unstaged\n");
+      assert.strictEqual((yield* git(["ls-tree", checkpointRef, "--", "empty"])).stdout, "");
       const worktreeCommands = observedArgs.filter((args) =>
-        ["add", "restore", "clean", "reset"].some((command) => args.includes(command)),
+        ["add", "--others", "restore", "clean", "reset"].some((command) => args.includes(command)),
       );
-      assert.strictEqual(worktreeCommands.length, 4);
+      // Failed add, recovery listing, retried add, then restore, clean and reset.
+      assert.strictEqual(worktreeCommands.length, 6);
       for (const args of worktreeCommands) {
         const setting = args.indexOf("core.longpaths=true");
         if (platform === "win32") assert.strictEqual(args[setting - 1], "-c", args.join(" "));
