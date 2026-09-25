@@ -780,6 +780,8 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
     "-c",
     "core.fsyncMethod=fsync",
   ] as const;
+  // Saved checkpoint indexes this server no longer writes; see `syncIgnoredEntries`.
+  const coldOnlyCheckpointIndexes = new Set<string>();
 
   const checkpoints: VcsDriver.VcsCheckpointOps = {
     captureCheckpoint: Effect.fn("GitVcsDriver.checkpoints.captureCheckpoint")(function* (input) {
@@ -858,7 +860,16 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
             ...(env !== undefined ? { env } : {}),
             maxOutputBytes: WORKSPACE_FILES_MAX_OUTPUT_BYTES,
             outputMode: "error",
-          }).pipe(Effect.map((result) => new Set(splitNullSeparatedGitStdoutPaths(result))));
+          }).pipe(
+            Effect.map((result) => new Set(splitNullSeparatedGitStdoutPaths(result))),
+            // Past the output cap, reuse cannot match a fresh capture, so stay cold like before.
+            Effect.tapErrorTag("VcsProcessOutputLimitError", () =>
+              Effect.sync(() => {
+                if (checkpointIndexPath !== null)
+                  coldOnlyCheckpointIndexes.add(checkpointIndexPath);
+              }),
+            ),
+          );
         const captured = yield* listIgnored(commitEnv);
         const tracked = yield* listIgnored();
         const updateIndex = (flags: ReadonlyArray<string>, paths: ReadonlyArray<string>) =>
@@ -1126,7 +1137,11 @@ export const makeVcsDriverShape = Effect.fn("makeGitVcsDriverShape")(function* (
           cwd: input.cwd,
           args: [...durableWrite, "update-ref", input.checkpointRef, commitOid],
         });
-        if (checkpointIndexPath !== null && !sparseCheckout) {
+        if (
+          checkpointIndexPath !== null &&
+          !sparseCheckout &&
+          !coldOnlyCheckpointIndexes.has(checkpointIndexPath)
+        ) {
           yield* fileSystem.rename(tempIndexPath, checkpointIndexPath).pipe(Effect.ignore);
         }
       });

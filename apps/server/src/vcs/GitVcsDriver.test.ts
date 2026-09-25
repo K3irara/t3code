@@ -1099,6 +1099,57 @@ it.effect.each(["corrupt", "pruned"] as const)(
     }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
 );
 
+it.effect("checkpoint capture stays cold when its ignored entries overflow the listing", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const liveProcess = yield* VcsProcess.VcsProcess;
+    const commands: string[] = [];
+    const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+      Effect.provideService(VcsProcess.VcsProcess, {
+        run: (input) => {
+          commands.push(input.args.join(" "));
+          // Any listing is over a one-byte cap, as a huge one is over the real cap.
+          return liveProcess.run(
+            input.args.includes("--ignored") ? { ...input, maxOutputBytes: 1 } : input,
+          );
+        },
+      }),
+    );
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-reuse-overflow-" });
+    const { git } = yield* makeCheckpointFixture(driver, cwd);
+    yield* fs.writeFileString(path.join(cwd, ".gitignore"), "*.log\n");
+    yield* fs.writeFileString(path.join(cwd, "tracked.log"), "tracked\n");
+    yield* git(["add", "--force", ".gitignore", "tracked.log"]);
+    yield* git(["commit", "-m", "track an ignored log"]);
+    yield* fs.writeFileString(path.join(cwd, "untracked.txt"), "untracked\n");
+    const checkpointIndex = path.join(cwd, ".git/t3-checkpoint-index");
+    const tree = (checkpointRef: CheckpointRef) =>
+      git(["rev-parse", `${checkpointRef}^{tree}`]).pipe(Effect.map((result) => result.stdout));
+    const first = CheckpointRef.make("refs/t3/checkpoints/overflow/first");
+    yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: first });
+    assert.isTrue(yield* fs.exists(checkpointIndex));
+
+    for (const turn of ["second", "third"]) {
+      const checkpointRef = CheckpointRef.make(`refs/t3/checkpoints/overflow/${turn}`);
+      commands.length = 0;
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef });
+
+      assert.strictEqual(
+        commands.some((command) => command.includes("--ignored")),
+        turn === "second",
+      );
+      assert.isTrue(commands.some((command) => command.includes("read-tree")));
+      assert.strictEqual(yield* tree(checkpointRef), yield* tree(first));
+      assert.strictEqual(
+        (yield* git(["show", `${checkpointRef}:tracked.log`])).stdout,
+        "tracked\n",
+      );
+      assert.isFalse(yield* fs.exists(checkpointIndex));
+    }
+  }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
+);
+
 it.effect("restores empty checkpoints without changing paths outside the workspace", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
