@@ -14,7 +14,12 @@ import * as PlatformError from "effect/PlatformError";
 import { ChildProcessSpawner } from "effect/unstable/process";
 import { assert, it } from "@effect/vitest";
 
-import { CheckpointRef, GitCommandError, VcsProcessExitError } from "@t3tools/contracts";
+import {
+  CheckpointRef,
+  GitCommandError,
+  VcsProcessExitError,
+  VcsProcessTimeoutError,
+} from "@t3tools/contracts";
 import * as ServerConfig from "../config.ts";
 import * as CheckpointStore from "../checkpointing/CheckpointStore.ts";
 import * as ProcessRunner from "../processRunner.ts";
@@ -1103,6 +1108,56 @@ it.effect.each(["corrupt", "pruned"] as const)(
       const replaced = yield* fs.readFile(checkpointIndex);
       assert.strictEqual(new TextDecoder().decode(replaced.subarray(0, 4)), "DIRC");
     }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
+);
+
+it.effect("a timed-out reused checkpoint capture keeps its index and does not retry cold", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const liveProcess = yield* VcsProcess.VcsProcess;
+    const commands: ReadonlyArray<string>[] = [];
+    const isStaging = (args: ReadonlyArray<string>) => args.includes("add") && args.includes("-A");
+    let timeOutStaging = false;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+      Effect.provideService(VcsProcess.VcsProcess, {
+        run: (input) => {
+          commands.push(input.args);
+          return timeOutStaging && isStaging(input.args)
+            ? Effect.fail(
+                new VcsProcessTimeoutError({
+                  operation: input.operation,
+                  command: input.command,
+                  cwd: input.cwd,
+                  argumentCount: input.args.length,
+                  timeoutMs: input.timeoutMs ?? 0,
+                }),
+              )
+            : liveProcess.run(input);
+        },
+      }),
+    );
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-reuse-timeout-" });
+    yield* makeCheckpointFixture(driver, cwd);
+    yield* fs.writeFileString(path.join(cwd, "untracked.txt"), "untracked\n");
+    const checkpointIndex = path.join(cwd, ".git/t3-checkpoint-index");
+    const first = CheckpointRef.make("refs/t3/checkpoints/timeout/first");
+    const second = CheckpointRef.make("refs/t3/checkpoints/timeout/second");
+    yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: first });
+    const savedIndex = yield* fs.readFile(checkpointIndex);
+    timeOutStaging = true;
+    commands.length = 0;
+
+    const error = yield* driver.checkpoints
+      .captureCheckpoint({ cwd, checkpointRef: second })
+      .pipe(Effect.flip);
+
+    assert.strictEqual(error._tag, "VcsProcessTimeoutError");
+    assert.lengthOf(commands.filter(isStaging), 1);
+    assert.isFalse(commands.some((args) => args.join(" ").includes("read-tree --reset")));
+    // A timeout is the working tree's cost, not a bad index, so the saved index stays as it was.
+    assert.deepEqual(yield* fs.readFile(checkpointIndex), savedIndex);
+    assert.isFalse(yield* driver.checkpoints.hasCheckpointRef({ cwd, checkpointRef: second }));
+  }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
 );
 
 it.effect("checkpoint capture stays cold when its ignored entries overflow the listing", () =>
