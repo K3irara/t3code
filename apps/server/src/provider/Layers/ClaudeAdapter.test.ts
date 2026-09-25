@@ -72,6 +72,7 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
   public readonly setMaxThinkingTokensCalls: Array<number | null> = [];
   public closeCalls = 0;
   public closeError: unknown | undefined;
+  public initializationError: unknown | undefined;
 
   emit(message: SDKMessage): void {
     if (this.done) {
@@ -106,6 +107,13 @@ class FakeClaudeQuery implements AsyncIterable<SDKMessage> {
       waiter.resolve({ done: true, value: undefined });
     }
   }
+
+  readonly initializationResult = async (): Promise<unknown> => {
+    if (this.initializationError !== undefined) {
+      throw this.initializationError;
+    }
+    return {};
+  };
 
   readonly setModel = async (model?: string): Promise<void> => {
     this.setModelCalls.push(model);
@@ -366,6 +374,52 @@ const sendCompletedClaudeTurn = (
     assert.equal(completed._tag, "Some");
     return turn;
   });
+
+const MISSING_CLAUDE_SESSION_ID = "9ff67172-10bd-4c35-8422-fd459ca18bd0";
+
+/** Fails a query the way the SDK does when `--resume` names a session with no transcript. */
+function failAsMissingClaudeSession(query: FakeClaudeQuery, sessionId: string): void {
+  const cliError = `No conversation found with session ID: ${sessionId}`;
+  const sdkError = new Error(`Claude Code returned an error result: ${cliError}`);
+  query.initializationError = sdkError;
+  query.emit({
+    type: "result",
+    subtype: "error_during_execution",
+    is_error: true,
+    num_turns: 0,
+    errors: [cliError],
+    session_id: sessionId,
+    uuid: "missing-session-result",
+  } as unknown as SDKMessage);
+  query.fail(sdkError);
+}
+
+/** A harness that hands out a new query per start, configured before the adapter sees it. */
+function makeQueryPerStartHarness(configure: (query: FakeClaudeQuery, index: number) => void) {
+  const queries: Array<FakeClaudeQuery> = [];
+  const inputs: Array<{
+    readonly prompt: AsyncIterable<SDKUserMessage>;
+    readonly options: ClaudeQueryOptions;
+  }> = [];
+  const layer = Layer.effect(
+    ClaudeAdapter,
+    makeClaudeAdapter(decodeClaudeSettings({}), {
+      modelCatalog: Effect.succeed(SYNTHETIC_CLAUDE_MODEL_CATALOG),
+      createQuery: (input) => {
+        const query = new FakeClaudeQuery();
+        configure(query, queries.length);
+        queries.push(query);
+        inputs.push(input);
+        return query;
+      },
+    }),
+  ).pipe(
+    Layer.provideMerge(ServerConfig.layerTest("/tmp/claude-adapter-test", "/tmp")),
+    Layer.provideMerge(ServerSettingsService.layerTest()),
+    Layer.provideMerge(NodeServices.layer),
+  );
+  return { layer, queries, inputs };
+}
 
 describe("ClaudeAdapterLive", () => {
   it.effect("returns validation error for non-claude provider on startSession", () => {
@@ -6463,6 +6517,173 @@ describe("ClaudeAdapterLive", () => {
       );
       assert.equal(createInput?.options.resume, undefined);
       assert.equal(createInput?.options.sessionId, sessionResumeCursor.resume);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("starts a fresh Claude session once when the resumed session no longer exists", () => {
+    const harness = makeQueryPerStartHarness((query, index) => {
+      if (index === 0) failAsMissingClaudeSession(query, MISSING_CLAUDE_SESSION_ID);
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      const session = yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        resumeCursor: {
+          threadId: RESUME_THREAD_ID,
+          resume: MISSING_CLAUDE_SESSION_ID,
+          turnCount: 1,
+          turnStartMessageIds: ["turn-before-restart"],
+        },
+        runtimeMode: "full-access",
+      });
+      const turn = yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "are you still there?",
+        attachments: [],
+        interactionMode: "default",
+      });
+
+      assert.equal(harness.queries.length, 2);
+      assert.equal(harness.queries[0]?.closeCalls, 1);
+      const [resumed, fresh] = harness.inputs;
+      assert.equal(resumed?.options.resume, MISSING_CLAUDE_SESSION_ID);
+      assert.equal(fresh?.options.resume, undefined);
+      const freshSessionId = fresh?.options.sessionId;
+      assert.match(
+        freshSessionId ?? "",
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      assert.notEqual(freshSessionId, MISSING_CLAUDE_SESSION_ID);
+      assert.equal(fresh?.options.permissionMode, resumed?.options.permissionMode);
+      assert.equal(fresh?.options.cwd, resumed?.options.cwd);
+      assert.deepEqual(harness.queries[1]?.setPermissionModeCalls, ["bypassPermissions"]);
+      assert.equal(yield* Effect.promise(() => readFirstPromptText(fresh)), "are you still there?");
+
+      assert.deepEqual(session.resumeCursor, {
+        threadId: RESUME_THREAD_ID,
+        resume: freshSessionId,
+        turnCount: 0,
+      });
+      assert.deepEqual(turn.resumeCursor, {
+        threadId: RESUME_THREAD_ID,
+        resume: freshSessionId,
+        turnCount: 1,
+        turnStartMessageIds: [turn.turnId],
+      });
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+      const warnings = runtimeEvents.filter((event) => event.type === "runtime.warning");
+      assert.equal(warnings.length, 1);
+      assert.equal(
+        runtimeEvents.some((event) => event.type === "runtime.error"),
+        false,
+      );
+      assert.equal(yield* adapter.hasSession(RESUME_THREAD_ID), true);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("surfaces a failed fresh start after a missing Claude session without retrying", () => {
+    const harness = makeQueryPerStartHarness((query, index) => {
+      if (index === 0) failAsMissingClaudeSession(query, MISSING_CLAUDE_SESSION_ID);
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        resumeCursor: { threadId: RESUME_THREAD_ID, resume: MISSING_CLAUDE_SESSION_ID },
+        runtimeMode: "full-access",
+      });
+      yield* adapter.sendTurn({
+        threadId: RESUME_THREAD_ID,
+        input: "hello",
+        attachments: [],
+      });
+      harness.queries[1]?.fail(new Error("Claude Code process exited with code 1"));
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+
+      assert.equal(harness.queries.length, 2);
+      assert.equal(runtimeEvents.filter((event) => event.type === "runtime.warning").length, 1);
+      const runtimeError = runtimeEvents.find((event) => event.type === "runtime.error");
+      assert.equal(runtimeError?.type, "runtime.error");
+      if (runtimeError?.type === "runtime.error") {
+        assert.equal(runtimeError.payload.message, "Claude runtime stream failed.");
+      }
+      assert.equal(runtimeEvents.at(-1)?.type, "session.exited");
+      assert.equal(yield* adapter.hasSession(RESUME_THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
+  it.effect("keeps the resumed Claude session when it fails for another reason", () => {
+    const harness = makeQueryPerStartHarness((query) => {
+      const failure = new Error("Claude Code process exited with code 1. stderr: Invalid API key");
+      query.initializationError = failure;
+      query.fail(failure);
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const runtimeEvents: Array<ProviderRuntimeEvent> = [];
+      const runtimeEventsFiber = yield* Stream.runForEach(adapter.streamEvents, (event) =>
+        Effect.sync(() => {
+          runtimeEvents.push(event);
+        }),
+      ).pipe(Effect.forkChild);
+
+      yield* adapter.startSession({
+        threadId: RESUME_THREAD_ID,
+        provider: ProviderDriverKind.make("claudeAgent"),
+        resumeCursor: { threadId: RESUME_THREAD_ID, resume: MISSING_CLAUDE_SESSION_ID },
+        runtimeMode: "full-access",
+      });
+
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      runtimeEventsFiber.interruptUnsafe();
+
+      assert.equal(harness.queries.length, 1);
+      assert.equal(harness.inputs[0]?.options.resume, MISSING_CLAUDE_SESSION_ID);
+      assert.deepEqual(
+        runtimeEvents.map((event) => event.type),
+        [
+          "session.started",
+          "session.configured",
+          "session.state.changed",
+          "runtime.error",
+          "session.exited",
+        ],
+      );
+      assert.equal(yield* adapter.hasSession(RESUME_THREAD_ID), false);
     }).pipe(
       Effect.provideService(Random.Random, makeDeterministicRandomService()),
       Effect.provide(harness.layer),

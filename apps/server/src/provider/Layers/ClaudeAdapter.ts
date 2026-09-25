@@ -457,6 +457,7 @@ interface ClaudeSessionContext {
 }
 
 interface ClaudeQueryRuntime extends AsyncIterable<SDKMessage> {
+  readonly initializationResult: () => Promise<unknown>;
   readonly setModel: (model?: string) => Promise<void>;
   readonly setPermissionMode: (mode: PermissionMode) => Promise<void>;
   readonly setMaxThinkingTokens: (maxThinkingTokens: number | null) => Promise<void>;
@@ -496,6 +497,18 @@ function hasDurableClaudeSessionId(message: SDKMessage): boolean {
     message.subtype !== "hook_started" &&
     message.subtype !== "hook_progress" &&
     message.subtype !== "hook_response"
+  );
+}
+
+/**
+ * Whether the CLI refused `--resume <sessionId>` because it has no transcript
+ * for it. The SDK rejects the query with the CLI's error result, e.g.
+ * "Claude Code returned an error result: No conversation found with session ID: <id>".
+ */
+function isMissingClaudeSessionError(cause: unknown, sessionId: string): boolean {
+  return (
+    cause instanceof Error &&
+    cause.message.includes(`No conversation found with session ID: ${sessionId}`)
   );
 }
 
@@ -4415,25 +4428,15 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
       }
 
       const startedAt = yield* nowIso;
-      const resumeState = readClaudeResumeState(input.resumeCursor);
+      let resumeState = readClaudeResumeState(input.resumeCursor);
       const threadId = input.threadId;
       const existingResumeSessionId = resumeState?.resume;
       const newSessionId = existingResumeSessionId === undefined ? yield* randomUUIDv4 : undefined;
-      const sessionId = existingResumeSessionId ?? newSessionId;
+      let sessionId = existingResumeSessionId ?? newSessionId;
 
       const runtimeContext = yield* Effect.context<never>();
       const runFork = Effect.runForkWith(runtimeContext);
       const runPromise = Effect.runPromiseWith(runtimeContext);
-
-      const promptQueue = yield* Queue.unbounded<PromptQueueItem>();
-      const prompt = Stream.fromQueue(promptQueue).pipe(
-        Stream.filter((item) => item.type === "message"),
-        Stream.map((item) => item.message),
-        Stream.catchCause((cause) =>
-          Cause.hasInterruptsOnly(cause) ? Stream.empty : Stream.failCause(cause),
-        ),
-        Stream.toAsyncIterable,
-      );
 
       const pendingApprovals = new Map<ApprovalRequestId, PendingApproval>();
       const pendingUserInputs = new Map<ApprovalRequestId, PendingUserInput>();
@@ -4990,20 +4993,67 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         "claude.query.path_to_executable": claudeBinaryPath,
       });
 
-      const queryRuntime = yield* Effect.try({
-        try: () =>
-          createQuery({
-            prompt,
-            options: queryOptions,
-          }),
-        catch: (cause) =>
-          new ProviderAdapterProcessError({
-            provider: PROVIDER,
-            threadId,
-            detail: "Failed to start Claude runtime session.",
-            cause,
-          }),
+      // Each query gets its own prompt queue: the SDK starts pulling prompts
+      // as soon as the query exists, so a query that is replaced must not keep
+      // a consumer on the queue its successor reads from.
+      const openQuery = Effect.fn("openClaudeQuery")(function* (options: ClaudeQueryOptions) {
+        const promptQueue = yield* Queue.unbounded<PromptQueueItem>();
+        const prompt = Stream.fromQueue(promptQueue).pipe(
+          Stream.filter((item) => item.type === "message"),
+          Stream.map((item) => item.message),
+          Stream.catchCause((cause) =>
+            Cause.hasInterruptsOnly(cause) ? Stream.empty : Stream.failCause(cause),
+          ),
+          Stream.toAsyncIterable,
+        );
+        const query = yield* Effect.try({
+          try: () => createQuery({ prompt, options }),
+          catch: (cause) =>
+            new ProviderAdapterProcessError({
+              provider: PROVIDER,
+              threadId,
+              detail: "Failed to start Claude runtime session.",
+              cause,
+            }),
+        });
+        return { promptQueue, query };
       });
+
+      let started = yield* openQuery(queryOptions);
+      const closeStartedQuery = Effect.try(() => started.query.close()).pipe(Effect.ignore);
+      // A persisted resume id can name a session the CLI never wrote to disk.
+      // The CLI then exits before taking a turn, and because the cursor keeps
+      // that id, every later turn would fail the same way. So a resumed query
+      // waits for the CLI to initialize (the first turn's control requests
+      // wait for that anyway) and starts fresh once if the session is missing.
+      // Any other failure still surfaces through the stream.
+      const resumeSessionMissing =
+        existingResumeSessionId !== undefined &&
+        (yield* Effect.promise(() =>
+          started.query.initializationResult().then(
+            () => false,
+            (cause: unknown) => isMissingClaudeSessionError(cause, existingResumeSessionId),
+          ),
+        ).pipe(Effect.onInterrupt(() => closeStartedQuery)));
+      if (resumeSessionMissing) {
+        sessionId = yield* randomUUIDv4;
+        yield* Effect.logWarning("claude session resume fell back to fresh start", {
+          threadId,
+          resumeSessionId: existingResumeSessionId,
+          sessionId,
+        });
+        yield* Effect.annotateCurrentSpan({
+          "claude.resume.fallback": "missing-session",
+          "claude.query.session_id": sessionId,
+        });
+        yield* closeStartedQuery;
+        yield* Queue.shutdown(started.promptQueue);
+        const { resume: _missingSessionId, ...freshQueryOptions } = queryOptions;
+        started = yield* openQuery({ ...freshQueryOptions, sessionId });
+        resumeState = undefined;
+      }
+      const queryRuntime = started.query;
+      const promptQueue = started.promptQueue;
 
       const session: ProviderSession = {
         threadId,
@@ -5104,6 +5154,14 @@ export const makeClaudeAdapter = Effect.fn("makeClaudeAdapter")(function* (
         },
         providerRefs: {},
       });
+
+      if (resumeSessionMissing) {
+        yield* emitRuntimeWarning(
+          context,
+          "Claude's previous session no longer exists, so a new one was started without its earlier context.",
+          { missingSessionId: existingResumeSessionId },
+        );
+      }
 
       let streamFiber: Fiber.Fiber<void, never>;
       streamFiber = runFork(
