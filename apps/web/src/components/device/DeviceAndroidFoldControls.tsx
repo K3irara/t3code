@@ -36,14 +36,21 @@ export function DeviceAndroidFoldControls(props: {
     if (!props.visible || !props.enabled || pending || !props.screenWidth || !props.screenHeight)
       return;
     const controller = new AbortController();
-    void readAndroidFold(props.access, props.deviceId, controller.signal)
-      .then((next) => {
-        if (!controller.signal.aborted) setFold(next);
-      })
-      .catch(() => {
-        if (!controller.signal.aborted) setFold(null);
-      });
-    return () => controller.abort();
+    let retry: number | undefined;
+    const read = () => {
+      void readAndroidFold(props.access, props.deviceId, controller.signal)
+        .then((next) => {
+          if (!controller.signal.aborted) setFold(next);
+        })
+        .catch(() => {
+          if (!controller.signal.aborted) retry = window.setTimeout(read, 3_000);
+        });
+    };
+    read();
+    return () => {
+      controller.abort();
+      window.clearTimeout(retry);
+    };
   }, [
     props.access,
     props.deviceId,
@@ -61,15 +68,24 @@ export function DeviceAndroidFoldControls(props: {
     busy.current = true;
     setPending(true);
     setError(null);
-    void setAndroidFold(props.access, props.deviceId, posture)
+    const controller = new AbortController();
+    const timeout = window.setTimeout(() => controller.abort(), 12_000);
+    void setAndroidFold(props.access, props.deviceId, posture, controller.signal)
       .then((next) => {
         if (mounted.current) setFold(next);
       })
       .catch((cause: unknown) => {
         if (mounted.current)
-          setError(cause instanceof Error ? cause.message : "Could not change fold posture.");
+          setError(
+            controller.signal.aborted
+              ? "Fold command timed out."
+              : cause instanceof Error
+                ? cause.message
+                : "Could not change fold posture.",
+          );
       })
       .finally(() => {
+        window.clearTimeout(timeout);
         busy.current = false;
         if (mounted.current) setPending(false);
       });

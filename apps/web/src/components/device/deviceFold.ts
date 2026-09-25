@@ -68,4 +68,5 @@ export const setAndroidFold = (
   access: DeviceHubAccess,
   deviceId: string,
   posture: AndroidFoldPosture,
-) => foldRequest(access, deviceId, posture);
+  signal?: AbortSignal,
+) => foldRequest(access, deviceId, posture, signal);
