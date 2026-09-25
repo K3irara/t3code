@@ -941,6 +941,164 @@ for (const indexState of ["missing", "invalid"] as const) {
   );
 }
 
+const makeRecordingDriver = Effect.fn("makeRecordingDriver")(function* () {
+  const liveProcess = yield* VcsProcess.VcsProcess;
+  const commands: ReadonlyArray<string>[] = [];
+  const driver = yield* GitVcsDriver.makeVcsDriverShape().pipe(
+    Effect.provideService(VcsProcess.VcsProcess, {
+      run: (input) => {
+        commands.push(input.args);
+        return liveProcess.run(input);
+      },
+    }),
+  );
+  return { driver, commands };
+});
+
+it.effect("checkpoint capture reuses its index so unchanged untracked files are not rehashed", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const { driver, commands } = yield* makeRecordingDriver();
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-reuse-" });
+    const { git } = yield* makeCheckpointFixture(driver, cwd);
+    // An old mtime keeps a file out of Git's racy window, where it would be hashed again.
+    const write = Effect.fn(function* (name: string, contents: string) {
+      yield* fs.makeDirectory(path.dirname(path.join(cwd, name)), { recursive: true });
+      yield* fs.writeFileString(path.join(cwd, name), contents);
+      yield* fs.utimes(path.join(cwd, name), 1_700_000_000, 1_700_000_000);
+    });
+    yield* fs.writeFileString(path.join(cwd, ".gitattributes"), "*.dat filter=probe\n");
+    yield* fs.writeFileString(
+      path.join(cwd, ".git/filter.cjs"),
+      'require("node:fs").appendFileSync(".git/reads", "read\\n"); process.stdin.pipe(process.stdout);',
+    );
+    yield* git(["config", "filter.probe.clean", "node .git/filter.cjs"]);
+    for (const name of ["cache/stable.dat", "cache/edited.dat", "deleted.dat"]) {
+      yield* write(name, `${name}\n`);
+    }
+    const originalIndex = yield* fs.readFile(path.join(cwd, ".git/index"));
+    const checkpointIndex = path.join(cwd, ".git/t3-checkpoint-index");
+    const first = CheckpointRef.make("refs/t3/checkpoints/reuse/first");
+    const second = CheckpointRef.make("refs/t3/checkpoints/reuse/second");
+    const cold = CheckpointRef.make("refs/t3/checkpoints/reuse/cold");
+    const captureCommands = Effect.fn(function* (checkpointRef: CheckpointRef) {
+      commands.length = 0;
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef });
+      return commands.map((args) => args.join(" "));
+    });
+
+    yield* captureCommands(first);
+    assert.isTrue(yield* fs.exists(checkpointIndex));
+    yield* write("cache/edited.dat", "edited\n");
+    yield* fs.remove(path.join(cwd, "deleted.dat"));
+    yield* fs.writeFileString(path.join(cwd, "file.txt"), "second turn\n");
+    yield* write("added.txt", "added\n");
+    yield* fs.writeFileString(path.join(cwd, ".git/reads"), "");
+    const warmCommands = yield* captureCommands(second);
+
+    assert.strictEqual(yield* fs.readFileString(path.join(cwd, ".git/reads")), "read\n");
+    assert.isFalse(warmCommands.some((command) => command.includes("read-tree")));
+    for (const [name, content] of [
+      ["cache/stable.dat", "cache/stable.dat\n"],
+      ["cache/edited.dat", "edited\n"],
+      ["file.txt", "second turn\n"],
+      ["added.txt", "added\n"],
+    ]) {
+      assert.strictEqual((yield* git(["show", `${second}:${name}`])).stdout, content);
+    }
+    assert.notInclude((yield* git(["ls-tree", "-r", "--name-only", second])).stdout, "deleted");
+
+    yield* fs.remove(checkpointIndex);
+    const coldCommands = yield* captureCommands(cold);
+    assert.isTrue(coldCommands.some((command) => command.includes("read-tree")));
+    assert.strictEqual(
+      (yield* git(["rev-parse", `${second}^{tree}`])).stdout,
+      (yield* git(["rev-parse", `${cold}^{tree}`])).stdout,
+    );
+    assert.deepEqual(yield* fs.readFile(path.join(cwd, ".git/index")), originalIndex);
+  }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
+);
+
+it.effect("checkpoint index reuse follows ignore rules like a fresh capture", () =>
+  Effect.gen(function* () {
+    const fs = yield* FileSystem.FileSystem;
+    const path = yield* Path.Path;
+    const driver = yield* GitVcsDriver.makeVcsDriverShape();
+    const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-reuse-ignored-" });
+    const { git } = yield* makeCheckpointFixture(driver, cwd);
+    const write = (name: string) =>
+      fs
+        .makeDirectory(path.dirname(path.join(cwd, name)), { recursive: true })
+        .pipe(Effect.andThen(fs.writeFileString(path.join(cwd, name), `${name}\n`)));
+    yield* write("tracked.log");
+    yield* git(["add", "tracked.log"]);
+    yield* git(["commit", "-m", "track a log"]);
+    yield* write("later.log");
+    yield* write("build/out.o");
+    const first = CheckpointRef.make("refs/t3/checkpoints/ignored/first");
+    const second = CheckpointRef.make("refs/t3/checkpoints/ignored/second");
+    const cold = CheckpointRef.make("refs/t3/checkpoints/ignored/cold");
+    const files = (checkpointRef: CheckpointRef) =>
+      git(["ls-tree", "-r", "--name-only", checkpointRef]).pipe(
+        Effect.map((result) => result.stdout.trim().split("\n")),
+      );
+
+    yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: first });
+    assert.includeMembers(yield* files(first), ["later.log", "build/out.o", "tracked.log"]);
+    yield* fs.writeFileString(path.join(cwd, ".gitignore"), "*.log\nbuild/\n");
+    yield* write("forced.log");
+    yield* git(["add", "--force", "forced.log"]);
+    yield* git(["commit", "-m", "track an ignored log"]);
+    yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: second });
+
+    assert.sameMembers(yield* files(second), [
+      ".gitignore",
+      "file.txt",
+      "forced.log",
+      "tracked.log",
+    ]);
+    yield* fs.remove(path.join(cwd, ".git/t3-checkpoint-index"));
+    yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: cold });
+    assert.strictEqual(
+      (yield* git(["rev-parse", `${second}^{tree}`])).stdout,
+      (yield* git(["rev-parse", `${cold}^{tree}`])).stdout,
+    );
+  }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
+);
+
+it.effect.each(["corrupt", "pruned"] as const)(
+  "checkpoint capture starts over when its reused index is %s",
+  (state) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const { driver, commands } = yield* makeRecordingDriver();
+      const cwd = yield* fs.makeTempDirectoryScoped({ prefix: "t3-checkpoint-reuse-invalid-" });
+      const { git } = yield* makeCheckpointFixture(driver, cwd);
+      yield* fs.writeFileString(path.join(cwd, "untracked.txt"), "untracked\n");
+      const checkpointIndex = path.join(cwd, ".git/t3-checkpoint-index");
+      const first = CheckpointRef.make("refs/t3/checkpoints/invalid/first");
+      const second = CheckpointRef.make("refs/t3/checkpoints/invalid/second");
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: first });
+      if (state === "corrupt") {
+        yield* fs.writeFileString(checkpointIndex, "invalid index");
+      } else {
+        // Nothing else references the untracked blob, so Git prunes it from under the index.
+        yield* git(["update-ref", "-d", first]);
+        yield* git(["prune", "--expire=now"]);
+      }
+      commands.length = 0;
+
+      yield* driver.checkpoints.captureCheckpoint({ cwd, checkpointRef: second });
+
+      assert.isTrue(commands.some((args) => args.includes("read-tree")));
+      assert.strictEqual((yield* git(["show", `${second}:untracked.txt`])).stdout, "untracked\n");
+      const replaced = yield* fs.readFile(checkpointIndex);
+      assert.strictEqual(new TextDecoder().decode(replaced.subarray(0, 4)), "DIRC");
+    }).pipe(Effect.scoped, Effect.provide(GitContractLayer)),
+);
+
 it.effect("restores empty checkpoints without changing paths outside the workspace", () =>
   Effect.gen(function* () {
     const fileSystem = yield* FileSystem.FileSystem;
