@@ -1,5 +1,4 @@
 import type { DeviceHubAccess } from "@t3tools/client-runtime/state/deviceHubAccess";
-import { FoldVertical, UnfoldVertical } from "lucide-react";
 import { useEffect, useRef, useState } from "react";
 import { Button } from "~/components/ui/button";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
@@ -9,6 +8,7 @@ import {
   type AndroidFoldPosture,
   type AndroidFoldState,
 } from "./deviceFold";
+import { DeviceDuoGlyph } from "./DeviceDuoGlyph";
 
 /** Capability comes from the emulator, not its AVD name or screen dimensions. */
 export function DeviceAndroidFoldControls(props: {
@@ -91,7 +91,7 @@ export function DeviceAndroidFoldControls(props: {
               />
             }
           >
-            <FoldVertical />
+            <DeviceDuoGlyph pose="closed" />
           </TooltipTrigger>
           <TooltipPopup side="left">Fold device</TooltipPopup>
         </Tooltip>
@@ -108,7 +108,7 @@ export function DeviceAndroidFoldControls(props: {
               />
             }
           >
-            <UnfoldVertical />
+            <DeviceDuoGlyph pose="open" />
           </TooltipTrigger>
           <TooltipPopup side="left">Unfold device</TooltipPopup>
         </Tooltip>
