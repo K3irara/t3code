@@ -950,9 +950,12 @@ function scenarios(): ReadonlyArray<ReplayScenario> {
 function makeRecorder({
   outPath,
   scenario,
+  checkout,
 }: {
   readonly outPath: string;
   readonly scenario: ReplayScenario;
+  /** Checkout root, scrubbed from recordings because it names the local worktree layout. */
+  readonly checkout: string;
 }): Effect.Effect<Recorder, PlatformError.PlatformError, FileSystem.FileSystem> {
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
@@ -969,7 +972,11 @@ function makeRecorder({
     const flush = () => {
       const outputRecords = codexReplayRecordingOutputRecords(records, {
         workspace: process.cwd(),
-        machine: { home: NodeOS.homedir(), hostname: NodeOS.hostname() },
+        machine: {
+          home: NodeOS.homedir(),
+          hostname: NodeOS.hostname(),
+          checkout,
+        },
       });
       return fs.writeFileString(
         outPath,
@@ -1412,7 +1419,8 @@ function runScenario({
   return Effect.gen(function* () {
     const fs = yield* FileSystem.FileSystem;
     const path = yield* Path.Path;
-    const recorder = yield* makeRecorder({ outPath, scenario });
+    const checkout = path.resolve(yield* path.fromFileUrl(new URL("../../..", import.meta.url)));
+    const recorder = yield* makeRecorder({ outPath, scenario, checkout });
 
     yield* fs.makeDirectory(path.dirname(outPath), { recursive: true });
     yield* Console.log(`Writing ${scenario.name} Codex replay events to ${recorder.path}`);
