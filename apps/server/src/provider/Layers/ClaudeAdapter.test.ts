@@ -6690,6 +6690,46 @@ describe("ClaudeAdapterLive", () => {
     );
   });
 
+  it.effect("fails a resumed Claude start whose initialization never finishes", () => {
+    let markInitializationRequested = () => {};
+    const initializationRequested = new Promise<void>((resolve) => {
+      markInitializationRequested = resolve;
+    });
+    const harness = makeQueryPerStartHarness((query) => {
+      (query as { initializationResult: () => Promise<unknown> }).initializationResult = () => {
+        markInitializationRequested();
+        return new Promise(() => {});
+      };
+    });
+    return Effect.gen(function* () {
+      const adapter = yield* ClaudeAdapter;
+      const startFiber = yield* adapter
+        .startSession({
+          threadId: RESUME_THREAD_ID,
+          provider: ProviderDriverKind.make("claudeAgent"),
+          resumeCursor: { threadId: RESUME_THREAD_ID, resume: MISSING_CLAUDE_SESSION_ID },
+          runtimeMode: "full-access",
+        })
+        .pipe(Effect.flip, Effect.forkChild);
+      yield* Effect.promise(() => initializationRequested);
+      yield* Effect.yieldNow;
+      yield* TestClock.adjust("60 seconds");
+
+      const error = yield* Fiber.join(startFiber);
+      assert.instanceOf(error, ProviderAdapterProcessError);
+      assert.equal(
+        error.detail,
+        "Claude did not finish initializing the resumed session within 60 seconds.",
+      );
+      assert.equal(harness.queries.length, 1);
+      assert.equal(harness.queries[0]?.closeCalls, 1);
+      assert.equal(yield* adapter.hasSession(RESUME_THREAD_ID), false);
+    }).pipe(
+      Effect.provideService(Random.Random, makeDeterministicRandomService()),
+      Effect.provide(harness.layer),
+    );
+  });
+
   it.effect("rewinds a steered Claude turn after recovery and preserves fork boundaries", () => {
     const forkCalls: Array<Parameters<NonNullable<ClaudeAdapterLiveOptions["forkSession"]>>> = [];
     let firstTurnId = "";
@@ -7877,6 +7917,20 @@ describe("ClaudeAdapterLive", () => {
 
   it.effect("routes Claude resume compaction through the shared user-input UI", () => {
     const harness = makeHarness();
+    let dialogPromise: Promise<unknown> | undefined;
+    // The SDK dispatches a dialog the CLI raised while loading the resumed
+    // session with the initialize response, before startSession has a context.
+    (harness.query as { initializationResult: () => Promise<unknown> }).initializationResult =
+      async () => {
+        dialogPromise = harness.getLastCreateQueryInput()?.options.onUserDialog?.(
+          {
+            dialogKind: "resume_return",
+            payload: { sessionAgeMinutes: 145, estimatedTokens: 275123 },
+          },
+          { signal: new AbortController().signal, requestId: "request-dialog" },
+        );
+        return {};
+      };
     return Effect.gen(function* () {
       const adapter = yield* ClaudeAdapter;
       const session = yield* adapter.startSession({
@@ -7885,24 +7939,12 @@ describe("ClaudeAdapterLive", () => {
         resumeCursor: { resume: "550e8400-e29b-41d4-a716-446655440000" },
         runtimeMode: "full-access",
       });
-      yield* Stream.take(adapter.streamEvents, 3).pipe(Stream.runDrain);
-
-      const onUserDialog = harness.getLastCreateQueryInput()?.options.onUserDialog;
-      assert.equal(typeof onUserDialog, "function");
-      if (!onUserDialog) return;
-
-      const dialogPromise = onUserDialog(
-        {
-          dialogKind: "resume_return",
-          payload: { sessionAgeMinutes: 145, estimatedTokens: 275123 },
-        },
-        { signal: new AbortController().signal, requestId: "request-dialog" },
-      );
-
-      const requested = yield* Stream.runHead(adapter.streamEvents);
-      assert.equal(requested._tag, "Some");
-      if (requested._tag !== "Some" || requested.value.type !== "user-input.requested") return;
-      const question = requested.value.payload.questions[0];
+      // The held dialog is shown once the session's startup events are out.
+      const startupEvents = yield* Stream.take(adapter.streamEvents, 4).pipe(Stream.runCollect);
+      const requested = Array.from(startupEvents).at(-1);
+      assert.equal(requested?.type, "user-input.requested");
+      if (requested?.type !== "user-input.requested") return;
+      const question = requested.payload.questions[0];
       assert.equal(question?.header, "Resume session");
       assert.match(question?.question ?? "", /2h 25m/);
       assert.match(question?.question ?? "", /275,123 tokens/);
@@ -7910,18 +7952,18 @@ describe("ClaudeAdapterLive", () => {
         question?.options.map((option) => option.label),
         ["Compact and continue", "Keep full history", "Don't ask again"],
       );
-      if (!question || !requested.value.requestId) return;
+      if (!question || !requested.requestId) return;
 
       yield* adapter.respondToUserInput(
         session.threadId,
-        ApprovalRequestId.make(requested.value.requestId),
+        ApprovalRequestId.make(requested.requestId),
         { [question.id]: "Compact and continue" },
       );
 
       const resolved = yield* Stream.runHead(adapter.streamEvents);
       assert.equal(resolved._tag, "Some");
       if (resolved._tag === "Some") assert.equal(resolved.value.type, "user-input.resolved");
-      assert.deepEqual(yield* Effect.promise(() => dialogPromise), {
+      assert.deepEqual(yield* Effect.promise(() => dialogPromise ?? Promise.resolve()), {
         behavior: "completed",
         result: "compact",
       });
